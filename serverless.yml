@@ -1,0 +1,163 @@
+service: service-3-state-machine
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: nodejs12.x
+  region: ${opt:region, 'us-east-2'}
+  iamRoleStatements: # permission to access dynamoDb table
+    - Effect: Allow
+      Action:
+        - dynamodb:*
+      Resource: arn:aws:dynamodb:us-east-2:535662744569:table/bookTable
+    - Effect: Allow
+      Action:
+        - dynamodb:*
+      Resource: arn:aws:dynamodb:us-east-2:535662744569:table/userTable
+    - Effect: Allow
+      Action:
+        - sns:*
+      Resource: arn:aws:sns:us-east-2:535662744569:NotifyCourier
+    - Effect: Allow
+      Action:
+        - sqs:*
+      Resource: arn:aws:sqs:us-east-2:535662744569:OrdersQueue
+    - Effect: Allow
+      Action:
+        - states:*
+      Resource: arn:aws:states:us-east-2:535662744569:stateMachine:storeCheckoutFlow
+
+plugins:
+  - serverless-step-functions
+
+functions:
+  checkInventory:
+    handler: handler.checkInventory
+  calculateTotal:
+    handler: handler.calculateTotal
+  redeemPoints:
+    handler: handler.redeemPoints
+  billCustomer:
+    handler: handler.billCustomer
+  restoreRedeemPoints:
+    handler: handler.restoreRedeemPoints
+  sqsWorker:
+    handler: handler.sqsWorker
+    events:
+      - sqs:
+          arn: arn:aws:sqs:us-east-2:535662744569:OrdersQueue
+          batchSize: 1
+  restoreQuantity:
+    handler: handler.restoreQuantity
+
+stepFunctions:
+  stateMachines:
+    storeCheckOutFlow: # step function logical name
+      name: storeCheckOutFlow # actual name of step function
+      definition:
+        StartAt: checkInventory # starting state
+        States: # defining about states
+          checkInventory:
+            Type: Task # Task type referes to something where some calculations or logic is involved
+            Resource: # you can give actual arn of the resource(like lambda function) or use logical reference provided by serverless template
+              Fn::GetAtt: [checkInventory, Arn] # you can also use !GetAtt
+            Catch: # for catching error and defining next state accordingly
+              - ErrorEquals: [BookNotFound]
+                Next: BookNotFoundError
+              - ErrorEquals: [BookOutOfStock]
+                Next: BookOutOfStockError
+            ResultPath: "$.book" # without ResultPath attribute the result will only contain the returned value from the lambda, however, now it will also contain the input value(which is defined by $ and '.book' appends the returned value ie book to the input)
+            Next: calculateTotal # next state name
+          calculateTotal:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [calculateTotal, Arn]
+            ResultPath: "$.total" # we are returning {"total": 100} from calculateTotal lambda so now the output of this state will have {"total": {"total": 100}} coz '$.total' places the returned value({"total": 100}) inside the total object. If ResultPath: "$.totalAmount" then we will get {"totalAmount": {"total": 100}} as an output in this state
+            Next: isRedeemNeeded
+          isRedeemNeeded:
+            Type: Choice
+            Choices:
+              - Variable: $.redeem # redeem input will contain boolean value
+                BooleanEquals: true
+                Next: RedeemPoints
+            Default: BillCustomer # if no redeem input is provided then by default goes to BillCustomer state
+          RedeemPoints:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [redeemPoints, Arn]
+            ResultPath: "$.total" # since total already exists from calculateTotal state machine result, now with this the total attribute will be replaced with the new value obtained from RedeemPoints state
+            Catch:
+              - ErrorEquals: [States.ALL] # general error handler
+                Next: RedeemPointsError
+            Next: BillCustomer # after redeeming points go to BillCustomer state
+          BillCustomer:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [billCustomer, Arn]
+            ResultPath: "$.billingStatus" # we will get output as "billingStatus": "Successfully Billed"
+            Retry:
+              - ErrorEquals: [States.ALL]
+                MaxAttempts: 3
+            Catch: # even after 3 retries the error still persists the this block is executed
+              - ErrorEquals: [States.ALL]
+                ResultPath: "$.customerBilling" # we need this to restore the redeemed points. without this we will only get the error message as response so we add this to get the previous input datas
+                Next: BillingError
+            Next: PrepareOrder
+          PrepareOrder: #Add to the queue, lambda worker, will allocate the quirier by calling a 3rd party api and reduce the amount from the item
+            Type: Task
+            Resource: arn:aws:states:::sqs:sendMessage.waitForTaskToken # resource name particular for step-function. You have to use this same name. With this stepFunction will sendMessage to sqs queue which will then invoke the lambda function(defined in lambda events attribute)
+            Parameters:
+              QueueUrl: https://sqs.us-east-2.amazonaws.com/535662744569/OrdersQueue # our user defined queue
+              MessageBody:
+                Input.$: "$" # "$" sign means take entire previous input
+                Token.$: "$$.Task.Token" # From the context. "$$" represents the contex object of the state machine
+            ResultPath: "$.courierStatus"
+            Catch:
+              - ErrorEquals: [NoCourierAvailable]
+                ResultPath: "$.courierError"
+                Next: RefundCustomer
+            Next: DispatchOrder
+          DispatchOrder:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish # publishing a message to sns topic
+            Parameters:
+              TopicArn: arn:aws:sns:us-east-2:535662744569:NotifyCourier # our sns resource where we are publishing the message
+              Message.$: "$" # message body will consist of entire input object which is dynamic so we have to use '.$' in Message.$
+            Next: Dispatched
+          Dispatched:
+            Type: Pass
+            Result: "Your order will be dispatched in 24 hours"
+            End: true
+          RefundCustomer:
+            Type: Pass
+            Result: "Customer is refunded" # make a lambda to call stripe api to refund
+            ResultPath: "$.refundStatus"
+            Next: RestoreQuantity
+          RestoreQuantity:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [restoreQuantity, Arn]
+            ResultPath: "$.quantityRestoreStatus"
+            Next: RestoreRedeemPoints
+          BookNotFoundError:
+            Type: Pass # pass type refers to those state where no any work is performed like transformations or processing on the input
+            Result: "No such book available"
+            End: true
+          BookOutOfStockError:
+            Type: Pass
+            Result: "Sorry, the books is out of stock"
+            End: true
+          RedeemPointsError:
+            Type: Pass
+            Result: "Error in redeeming points"
+            End: true
+          BillingError:
+            Type: Pass
+            Result: "Billing error"
+            ResultPath: "$.billingStatus"
+            Next: RestoreRedeemPoints # since we have already deducted the redeempoints(if any), we first have to restore that and hence we can't end the state here
+          RestoreRedeemPoints:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [restoreRedeemPoints, Arn]
+            End: true
